@@ -1,0 +1,179 @@
+{
+    "id": "8a7a85d30c1477cc",
+    "label": "checkbattery",
+    "nodes": [
+        {
+            "id": "cb_changelog",
+            "type": "comment",
+            "z": "8a7a85d30c1477cc",
+            "name": "=== Changelog ===",
+            "info": "### 2026-05-05\n- Bootstrap: subscribe to bat_ost, bat_west, bat_big at central MQTT broker; capture last payload per topic into `global.checkbattery_samples` for schema discovery.",
+            "x": 160,
+            "y": 40,
+            "wires": []
+        },
+        {
+            "id": "cb_mqtt_bat_ost",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_ost",
+            "topic": "bat_ost",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 120,
+            "wires": [
+                [
+                    "cb_capture_sample"
+                ]
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_west",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_west",
+            "topic": "bat_west",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 180,
+            "wires": [
+                [
+                    "cb_capture_sample"
+                ]
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_big",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_big",
+            "topic": "bat_big",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 240,
+            "wires": [
+                [
+                    "cb_capture_sample"
+                ]
+            ]
+        },
+        {
+            "id": "cb_capture_sample",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "capture_sample",
+            "func": "const samples = global.get('checkbattery_samples') || {};\nsamples[msg.topic] = {\n    ts: new Date().toISOString(),\n    payloadType: typeof msg.payload,\n    payload: msg.payload\n};\nglobal.set('checkbattery_samples', samples);\nreturn msg;\n",
+            "outputs": 1,
+            "timeout": 0,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 380,
+            "y": 180,
+            "wires": [
+                [
+                    "cb_debug"
+                ]
+            ]
+        },
+        {
+            "id": "cb_debug",
+            "type": "debug",
+            "z": "8a7a85d30c1477cc",
+            "name": "checkbattery debug",
+            "active": true,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "true",
+            "targetType": "full",
+            "statusVal": "",
+            "statusType": "auto",
+            "x": 620,
+            "y": 180,
+            "wires": []
+        },
+        {
+            "id": "cb_mqtt_bat_ost_w",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_ost/#",
+            "topic": "bat_ost/#",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 300,
+            "wires": [
+                [
+                    "cb_capture_sample"
+                ]
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_west_w",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_west/#",
+            "topic": "bat_west/#",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 340,
+            "wires": [
+                [
+                    "cb_capture_sample"
+                ]
+            ]
+        },
+        {
+            "id": "cb_mqtt_bat_big_w",
+            "type": "mqtt in",
+            "z": "8a7a85d30c1477cc",
+            "name": "bat_big/#",
+            "topic": "bat_big/#",
+            "qos": "0",
+            "datatype": "auto",
+            "broker": "mqtt_broker_config",
+            "nl": false,
+            "rap": true,
+            "rh": 0,
+            "inputs": 0,
+            "x": 140,
+            "y": 380,
+            "wires": [
+                [
+                    "cb_capture_sample"
+                ]
+            ]
+        }
+    ]
+}
