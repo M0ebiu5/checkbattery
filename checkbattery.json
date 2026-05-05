@@ -7,7 +7,7 @@
             "type": "comment",
             "z": "8a7a85d30c1477cc",
             "name": "=== Changelog ===",
-            "info": "### 2026-05-05\n- Iter2: wire monitoring pipeline. cron-plus tick @ 180s aligned -> cb_evaluate -> alert MQTT (`checkbattery/alert`) + InfluxDB `infra.bms_health`.\n- Health checks: comm dropout (3min), cell delta warn/alert (50/100mV), cell hard limits (2.8/3.6V), per-cell outlier (30mV from bank avg), temperatures 1+2 (-10/50°C, sensors 3/4 ignored), MOSFET temp (60°C), switch charge/discharge OFF, BMS reboot, cycle counter monotonic.\n- InfluxDB metrics per bank: soc_percent, total_voltage, current, power, balance_current, num_cycles, cell_delta/min/max/avg, capacity_ah, mosfet_temp, temp1, temp2.\n- Alerts emit only on state transitions (active / cleared) — no per-tick spam.\n\n### 2026-05-05\n- Bootstrap: subscribe to bat_ost, bat_west, bat_big at central MQTT broker; capture last payload per leaf-topic into `global.checkbattery_samples` for schema discovery.\n",
+            "info": "### 2026-05-05\n- Iter3: debounce + trend.\n- Per-condition debounce in `cb_evaluate`. Statistical checks (cell_delta_warn/alert, cell_outlier_*, temp_high/low_*, mosfet_temp_high) require 3 consecutive ticks (~9min @ 180s) before flipping state. Safety-critical checks (no_data, comm_dropout, cell_under, cell_over, switch_charge_off, switch_discharge_off) emit `active` immediately, require 3 clear ticks to resolve. Events (bms_reboot, cycles_reset) stay one-shot.\n- Trend pipeline: `cb_trend_cron` (cronplus, hourly @ HH:05) -> `cb_trend_query` (influxdb in, raw output, 1h-bucketed MEDIAN of cell_delta over 24h GROUP BY bank) -> `cb_trend_eval` (linear regression of slope, mV/day) -> `cb_alert_out`. Threshold 5 mV/day; needs >=6 hourly buckets.\n\n### 2026-05-05\n- Iter2: monitoring pipeline. cron-plus tick @ 180s aligned -> cb_evaluate -> alert MQTT (`checkbattery/alert`) + InfluxDB `infra.bms_health`.\n- Health checks: comm dropout (3min), cell delta warn/alert (50/100mV), cell hard limits (2.8/3.6V), per-cell outlier (30mV from bank avg), temperatures 1+2 (-10/50C, sensors 3/4 ignored), MOSFET temp (60C), switch charge/discharge OFF, BMS reboot, cycle counter monotonic.\n- InfluxDB metrics per bank: soc_percent, total_voltage, current, power, balance_current, num_cycles, cell_delta/min/max/avg, capacity_ah, mosfet_temp, temp1, temp2.\n- Alerts emit only on state transitions (active / cleared) -- no per-tick spam.\n\n### 2026-05-05\n- Bootstrap: subscribe to bat_ost, bat_west, bat_big at central MQTT broker; capture last payload per leaf-topic into `global.checkbattery_samples` for schema discovery.\n",
             "x": 160,
             "y": 40,
             "wires": []
@@ -132,7 +132,7 @@
             "type": "function",
             "z": "8a7a85d30c1477cc",
             "name": "evaluate",
-            "func": "// Run health checks per bank. Emit alert MQTT messages on state transitions\n// (active / cleared) and an InfluxDB batch of important metrics every tick.\n// Out 1 = alerts (one msg per transition, topic=checkbattery/alert)\n// Out 2 = influx batch (single msg with payload=[points...])\n\nconst NOW = Date.now();\nconst NOW_ISO = new Date(NOW).toISOString();\nconst BANKS = ['bat_ost', 'bat_west', 'bat_big'];\n\nconst STATE = flow.get('bms_state') || {};\nconst HIST  = flow.get('bms_history') || {};   // bms_history[bank][code] = {since}\nconst PREV  = flow.get('bms_prev') || {};      // bms_prev[bank] = {uptime, cycles}\n\nconst TH = {\n    cell_delta_warn:  0.050,\n    cell_delta_alert: 0.100,\n    cell_min:         2.80,\n    cell_max:         3.60,\n    cell_outlier:     0.030,\n    temp_min:         -10,\n    temp_max:         50,\n    mosfet_temp_max:  60,\n    comm_dropout_ms:  3 * 60 * 1000\n};\n\nconst alerts = [];\nconst points = [];\n\nfunction num(v) {\n    if (v === undefined || v === null) return null;\n    const n = parseFloat(v);\n    return Number.isFinite(n) ? n : null;\n}\n\nfunction track(bank, code, value, severity, message) {\n    const h = HIST[bank] || (HIST[bank] = {});\n    if (h[code]) return;  // already active, no re-emit\n    h[code] = { since: NOW_ISO };\n    alerts.push({\n        ts: NOW_ISO, bank, severity, code, msg: message,\n        value, since: NOW_ISO, state: 'active'\n    });\n}\n\nfunction clear(bank, code) {\n    const h = HIST[bank];\n    if (h && h[code]) {\n        const since = h[code].since;\n        delete h[code];\n        alerts.push({\n            ts: NOW_ISO, bank, severity: 'info', code,\n            msg: 'cleared', value: null, since, state: 'cleared'\n        });\n    }\n}\n\nfor (const bank of BANKS) {\n    const s = STATE[bank];\n    const get = (path) => (s && s[path]) ? num(s[path].value) : null;\n\n    if (!s || Object.keys(s).length === 0) {\n        track(bank, 'no_data', null, 'alert', 'No data ever received from bank');\n        continue;\n    } else {\n        clear(bank, 'no_data');\n    }\n\n    // Comm dropout\n    let newestTs = 0;\n    for (const k in s) { if (s[k]._ts > newestTs) newestTs = s[k]._ts; }\n    const ageMs = NOW - newestTs;\n    if (ageMs > TH.comm_dropout_ms) {\n        track(bank, 'comm_dropout', Math.round(ageMs/1000), 'alert',\n            `No update in ${Math.round(ageMs/1000)}s`);\n    } else {\n        clear(bank, 'comm_dropout');\n    }\n\n    // Cell voltages (deltas, hard limits, per-cell outlier)\n    const cellMin = get('cell_voltages/min');\n    const cellMax = get('cell_voltages/max');\n    const cellAvg = get('cell_voltages/average');\n    const cellDelta = get('cell_voltages/delta');\n    const minIdx = get('cell_voltages/min_index');\n    const maxIdx = get('cell_voltages/max_index');\n\n    if (cellDelta !== null) {\n        if (cellDelta >= TH.cell_delta_alert) {\n            clear(bank, 'cell_delta_warn');\n            track(bank, 'cell_delta_alert', cellDelta, 'alert',\n                `Cell delta ${(cellDelta*1000).toFixed(0)}mV >= ${TH.cell_delta_alert*1000}mV (cell ${maxIdx} high, cell ${minIdx} low)`);\n        } else if (cellDelta >= TH.cell_delta_warn) {\n            clear(bank, 'cell_delta_alert');\n            track(bank, 'cell_delta_warn', cellDelta, 'warn',\n                `Cell delta ${(cellDelta*1000).toFixed(0)}mV >= ${TH.cell_delta_warn*1000}mV (cell ${maxIdx} high, cell ${minIdx} low)`);\n        } else {\n            clear(bank, 'cell_delta_alert');\n            clear(bank, 'cell_delta_warn');\n        }\n    }\n\n    if (cellMin !== null && cellMin < TH.cell_min) {\n        track(bank, 'cell_under', cellMin, 'alert',\n            `Cell ${minIdx} at ${cellMin.toFixed(3)}V below ${TH.cell_min}V`);\n    } else clear(bank, 'cell_under');\n\n    if (cellMax !== null && cellMax > TH.cell_max) {\n        track(bank, 'cell_over', cellMax, 'alert',\n            `Cell ${maxIdx} at ${cellMax.toFixed(3)}V above ${TH.cell_max}V`);\n    } else clear(bank, 'cell_over');\n\n    if (cellAvg !== null) {\n        for (let i = 1; i <= 16; i++) {\n            const v = get('cell_voltages/' + i);\n            if (v === null) continue;\n            const dev = Math.abs(v - cellAvg);\n            const code = 'cell_outlier_' + i;\n            if (dev > TH.cell_outlier) {\n                track(bank, code, v, 'warn',\n                    `Cell ${i} at ${v.toFixed(3)}V deviates ${(dev*1000).toFixed(0)}mV from bank avg ${cellAvg.toFixed(3)}V`);\n            } else {\n                clear(bank, code);\n            }\n        }\n    }\n\n    // Temperatures (only sensors 1 and 2; 3 and 4 are unused per project)\n    for (const i of [1, 2]) {\n        const t = get('temperatures/' + i);\n        if (t === null) continue;\n        const codeHi = 'temp_high_' + i;\n        const codeLo = 'temp_low_' + i;\n        if (t > TH.temp_max) {\n            clear(bank, codeLo);\n            track(bank, codeHi, t, 'alert',\n                `Temp sensor ${i} at ${t.toFixed(1)}°C above ${TH.temp_max}°C`);\n        } else if (t < TH.temp_min) {\n            clear(bank, codeHi);\n            track(bank, codeLo, t, 'alert',\n                `Temp sensor ${i} at ${t.toFixed(1)}°C below ${TH.temp_min}°C`);\n        } else {\n            clear(bank, codeHi);\n            clear(bank, codeLo);\n        }\n    }\n\n    const mosfetTemp = get('mosfet_status/temperature');\n    if (mosfetTemp !== null && mosfetTemp > TH.mosfet_temp_max) {\n        track(bank, 'mosfet_temp_high', mosfetTemp, 'alert',\n            `MOSFET temp ${mosfetTemp.toFixed(1)}°C above ${TH.mosfet_temp_max}°C`);\n    } else clear(bank, 'mosfet_temp_high');\n\n    // Switch states (charge/discharge expected ON; balance is normal in either state)\n    const swCharge = (s['switch/charge'] || {}).value;\n    const swDisch  = (s['switch/discharge'] || {}).value;\n    if (swCharge && String(swCharge) !== 'ON') {\n        track(bank, 'switch_charge_off', swCharge, 'alert', `Charge switch is ${swCharge}`);\n    } else clear(bank, 'switch_charge_off');\n    if (swDisch && String(swDisch) !== 'ON') {\n        track(bank, 'switch_discharge_off', swDisch, 'alert', `Discharge switch is ${swDisch}`);\n    } else clear(bank, 'switch_discharge_off');\n\n    // Reboot detection (uptime monotonic, allow 10s slack)\n    const uptime = get('bms/uptime');\n    if (uptime !== null) {\n        const prevUp = (PREV[bank] || {}).uptime;\n        if (prevUp !== undefined && uptime < prevUp - 10000) {\n            track(bank, 'bms_reboot', uptime, 'warn',\n                `BMS uptime decreased: ${prevUp}ms -> ${uptime}ms (likely reboot)`);\n        } else {\n            clear(bank, 'bms_reboot');\n        }\n        PREV[bank] = PREV[bank] || {};\n        PREV[bank].uptime = uptime;\n    }\n\n    // Cycle counter monotonic\n    const cycles = get('soc/num_cycles');\n    if (cycles !== null) {\n        const prevCyc = (PREV[bank] || {}).cycles;\n        if (prevCyc !== undefined && cycles < prevCyc) {\n            track(bank, 'cycles_reset', cycles, 'warn',\n                `Cycle counter decreased: ${prevCyc} -> ${cycles}`);\n        } else {\n            clear(bank, 'cycles_reset');\n        }\n        PREV[bank] = PREV[bank] || {};\n        PREV[bank].cycles = cycles;\n    }\n\n    // InfluxDB point: only the important values (per user)\n    const fields = {};\n    const map = {\n        soc_percent:     'soc/soc_percent',\n        total_voltage:   'soc/total_voltage',\n        current:         'soc/current',\n        power:           'soc/power',\n        balance_current: 'soc/balance_current',\n        num_cycles:      'soc/num_cycles',\n        cell_delta:      'cell_voltages/delta',\n        cell_min:        'cell_voltages/min',\n        cell_max:        'cell_voltages/max',\n        cell_avg:        'cell_voltages/average',\n        capacity_ah:     'mosfet_status/capacity_ah',\n        mosfet_temp:     'mosfet_status/temperature',\n        temp1:           'temperatures/1',\n        temp2:           'temperatures/2'\n    };\n    for (const fk in map) {\n        const v = get(map[fk]);\n        if (v !== null) fields[fk] = v;\n    }\n    if (Object.keys(fields).length > 0) {\n        points.push({\n            measurement: 'bms_health',\n            tags: { bank },\n            fields,\n            timestamp: NOW\n        });\n    }\n}\n\nflow.set('bms_history', HIST);\nflow.set('bms_prev', PREV);\n\nconst outAlerts = alerts.map(a => ({ topic: 'checkbattery/alert', payload: a }));\nconst outInflux = points.length > 0 ? { payload: points } : null;\nreturn [outAlerts, outInflux];\n",
+            "func": "// Per-tick health checks with per-condition debounce.\n//   - Statistical checks (default {active:3, clear:3}) require 3 consecutive\n//     ticks (~9min @ 180s) before flipping state — suppresses BMS noise.\n//   - Safety-critical checks ({active:1, clear:3}) emit 'active' on the first\n//     tick the condition holds, but require 3 clear ticks before resolving.\n//   - Events (bms_reboot, cycles_reset) emit one-shot, no debounce.\n// Out 1 = alerts (one msg per emit, topic=checkbattery/alert)\n// Out 2 = influx batch (single msg with payload=[points...])\n\nconst NOW = Date.now();\nconst NOW_ISO = new Date(NOW).toISOString();\nconst BANKS = ['bat_ost', 'bat_west', 'bat_big'];\n\nconst STATE = flow.get('bms_state') || {};\nconst PREV  = flow.get('bms_prev') || {};\nconst DB    = flow.get('bms_debounce') || {};\n\nconst TH = {\n    cell_delta_warn:  0.050,\n    cell_delta_alert: 0.100,\n    cell_min:         2.80,\n    cell_max:         3.60,\n    cell_outlier:     0.030,\n    temp_min:         -10,\n    temp_max:         50,\n    mosfet_temp_max:  60,\n    comm_dropout_ms:  3 * 60 * 1000\n};\n\nconst DEBOUNCE = {\n    no_data:               { active: 1, clear: 3 },\n    comm_dropout:          { active: 1, clear: 3 },\n    cell_under:            { active: 1, clear: 3 },\n    cell_over:             { active: 1, clear: 3 },\n    switch_charge_off:     { active: 1, clear: 3 },\n    switch_discharge_off:  { active: 1, clear: 3 }\n};\nconst DEBOUNCE_DEFAULT = { active: 3, clear: 3 };\n\nconst alerts = [];\nconst points = [];\n\nfunction num(v) {\n    if (v === undefined || v === null) return null;\n    const n = parseFloat(v);\n    return Number.isFinite(n) ? n : null;\n}\n\n// hold=true: condition currently violating; hold=false: currently OK.\nfunction condition(bank, code, hold, value, severity, message) {\n    const cfg = DEBOUNCE[code] || DEBOUNCE_DEFAULT;\n    const bankDb = DB[bank] || (DB[bank] = {});\n    let e = bankDb[code];\n    if (!e) {\n        e = { state: 'clear', candidate: 'clear', count: 0 };\n        bankDb[code] = e;\n    }\n    const cand = hold ? 'active' : 'clear';\n    if (cand === e.state) {\n        e.candidate = cand;\n        e.count = 0;\n        if (hold) e.value = value;\n        return;\n    }\n    if (cand === e.candidate) {\n        e.count++;\n    } else {\n        e.candidate = cand;\n        e.count = 1;\n    }\n    if (hold) e.value = value;\n    const need = hold ? cfg.active : cfg.clear;\n    if (e.count >= need) {\n        if (hold) {\n            e.state = 'active';\n            e.since = NOW_ISO;\n            alerts.push({\n                ts: NOW_ISO, bank, severity, code, msg: message,\n                value, since: NOW_ISO, state: 'active', debounceTicks: need\n            });\n        } else {\n            const since = e.since;\n            e.state = 'clear';\n            delete e.since;\n            alerts.push({\n                ts: NOW_ISO, bank, severity: 'info', code,\n                msg: 'cleared', value: null, since, state: 'cleared'\n            });\n        }\n        e.count = 0;\n    }\n}\n\nfunction event(bank, code, value, severity, message) {\n    alerts.push({\n        ts: NOW_ISO, bank, severity, code, msg: message,\n        value, since: NOW_ISO, state: 'event'\n    });\n}\n\nfor (const bank of BANKS) {\n    const s = STATE[bank];\n    const get = (path) => (s && s[path]) ? num(s[path].value) : null;\n\n    const hasData = !!s && Object.keys(s).length > 0;\n    condition(bank, 'no_data', !hasData, null, 'alert', 'No data ever received from bank');\n    if (!hasData) continue;\n\n    let newestTs = 0;\n    for (const k in s) if (s[k]._ts > newestTs) newestTs = s[k]._ts;\n    const ageMs = NOW - newestTs;\n    const ageS = Math.round(ageMs / 1000);\n    condition(bank, 'comm_dropout', ageMs > TH.comm_dropout_ms, ageS, 'alert',\n        `No update in ${ageS}s`);\n\n    const cellMin   = get('cell_voltages/min');\n    const cellMax   = get('cell_voltages/max');\n    const cellAvg   = get('cell_voltages/average');\n    const cellDelta = get('cell_voltages/delta');\n    const minIdx    = get('cell_voltages/min_index');\n    const maxIdx    = get('cell_voltages/max_index');\n\n    if (cellDelta !== null) {\n        const isAlertDelta = cellDelta >= TH.cell_delta_alert;\n        const isWarnDelta  = !isAlertDelta && cellDelta >= TH.cell_delta_warn;\n        condition(bank, 'cell_delta_alert', isAlertDelta, cellDelta, 'alert',\n            `Cell delta ${(cellDelta*1000).toFixed(0)}mV >= ${TH.cell_delta_alert*1000}mV (cell ${maxIdx} high, cell ${minIdx} low)`);\n        condition(bank, 'cell_delta_warn', isWarnDelta, cellDelta, 'warn',\n            `Cell delta ${(cellDelta*1000).toFixed(0)}mV >= ${TH.cell_delta_warn*1000}mV (cell ${maxIdx} high, cell ${minIdx} low)`);\n    }\n\n    if (cellMin !== null) {\n        condition(bank, 'cell_under', cellMin < TH.cell_min, cellMin, 'alert',\n            `Cell ${minIdx} at ${cellMin.toFixed(3)}V below ${TH.cell_min}V`);\n    }\n    if (cellMax !== null) {\n        condition(bank, 'cell_over', cellMax > TH.cell_max, cellMax, 'alert',\n            `Cell ${maxIdx} at ${cellMax.toFixed(3)}V above ${TH.cell_max}V`);\n    }\n\n    if (cellAvg !== null) {\n        for (let i = 1; i <= 16; i++) {\n            const v = get('cell_voltages/' + i);\n            if (v === null) {\n                condition(bank, 'cell_outlier_' + i, false, null, 'warn', '');\n                continue;\n            }\n            const dev = Math.abs(v - cellAvg);\n            condition(bank, 'cell_outlier_' + i, dev > TH.cell_outlier, v, 'warn',\n                `Cell ${i} at ${v.toFixed(3)}V deviates ${(dev*1000).toFixed(0)}mV from bank avg ${cellAvg.toFixed(3)}V`);\n        }\n    }\n\n    for (const i of [1, 2]) {\n        const t = get('temperatures/' + i);\n        if (t === null) {\n            condition(bank, 'temp_high_' + i, false, null, 'alert', '');\n            condition(bank, 'temp_low_'  + i, false, null, 'alert', '');\n            continue;\n        }\n        condition(bank, 'temp_high_' + i, t > TH.temp_max, t, 'alert',\n            `Temp sensor ${i} at ${t.toFixed(1)}C above ${TH.temp_max}C`);\n        condition(bank, 'temp_low_' + i, t < TH.temp_min, t, 'alert',\n            `Temp sensor ${i} at ${t.toFixed(1)}C below ${TH.temp_min}C`);\n    }\n\n    const mosfetTemp = get('mosfet_status/temperature');\n    if (mosfetTemp !== null) {\n        condition(bank, 'mosfet_temp_high', mosfetTemp > TH.mosfet_temp_max, mosfetTemp, 'alert',\n            `MOSFET temp ${mosfetTemp.toFixed(1)}C above ${TH.mosfet_temp_max}C`);\n    }\n\n    const swCharge = (s['switch/charge'] || {}).value;\n    const swDisch  = (s['switch/discharge'] || {}).value;\n    if (swCharge !== undefined) {\n        condition(bank, 'switch_charge_off', String(swCharge) !== 'ON', swCharge, 'alert',\n            `Charge switch is ${swCharge}`);\n    }\n    if (swDisch !== undefined) {\n        condition(bank, 'switch_discharge_off', String(swDisch) !== 'ON', swDisch, 'alert',\n            `Discharge switch is ${swDisch}`);\n    }\n\n    const uptime = get('bms/uptime');\n    if (uptime !== null) {\n        const prevUp = (PREV[bank] || {}).uptime;\n        if (prevUp !== undefined && uptime < prevUp - 10000) {\n            event(bank, 'bms_reboot', uptime, 'warn',\n                `BMS uptime decreased: ${prevUp}ms -> ${uptime}ms (likely reboot)`);\n        }\n        PREV[bank] = PREV[bank] || {};\n        PREV[bank].uptime = uptime;\n    }\n\n    const cycles = get('soc/num_cycles');\n    if (cycles !== null) {\n        const prevCyc = (PREV[bank] || {}).cycles;\n        if (prevCyc !== undefined && cycles < prevCyc) {\n            event(bank, 'cycles_reset', cycles, 'warn',\n                `Cycle counter decreased: ${prevCyc} -> ${cycles}`);\n        }\n        PREV[bank] = PREV[bank] || {};\n        PREV[bank].cycles = cycles;\n    }\n\n    const fields = {};\n    const map = {\n        soc_percent:     'soc/soc_percent',\n        total_voltage:   'soc/total_voltage',\n        current:         'soc/current',\n        power:           'soc/power',\n        balance_current: 'soc/balance_current',\n        num_cycles:      'soc/num_cycles',\n        cell_delta:      'cell_voltages/delta',\n        cell_min:        'cell_voltages/min',\n        cell_max:        'cell_voltages/max',\n        cell_avg:        'cell_voltages/average',\n        capacity_ah:     'mosfet_status/capacity_ah',\n        mosfet_temp:     'mosfet_status/temperature',\n        temp1:           'temperatures/1',\n        temp2:           'temperatures/2'\n    };\n    for (const fk in map) {\n        const v = get(map[fk]);\n        if (v !== null) fields[fk] = v;\n    }\n    if (Object.keys(fields).length > 0) {\n        points.push({\n            measurement: 'bms_health',\n            tags: { bank },\n            fields,\n            timestamp: NOW\n        });\n    }\n}\n\nflow.set('bms_debounce', DB);\nflow.set('bms_prev', PREV);\n\nconst outAlerts = alerts.map(a => ({ topic: 'checkbattery/alert', payload: a }));\nconst outInflux = points.length > 0 ? { payload: points } : null;\nreturn [outAlerts, outInflux];\n",
             "outputs": 2,
             "timeout": 0,
             "noerr": 0,
@@ -147,7 +147,8 @@
                     "cb_eval_debug"
                 ],
                 [
-                    "cb_influx_out"
+                    "cb_influx_out",
+                    "8eb9d7b9d7f29c88"
                 ]
             ]
         },
@@ -190,10 +191,10 @@
             "id": "cb_influx_out",
             "type": "influxdb batch",
             "z": "8a7a85d30c1477cc",
-            "name": "infra.bms_health",
-            "influxdb": "influxdb_config_infra",
+            "influxdb": "influxdb_config",
             "precision": "ms",
             "retentionPolicy": "",
+            "name": "infra.bms_health",
             "database": "database",
             "precisionV18FluxV20": "ms",
             "retentionPolicyV18Flux": "",
@@ -201,6 +202,113 @@
             "bucket": "bucket",
             "x": 670,
             "y": 600,
+            "wires": []
+        },
+        {
+            "id": "8eb9d7b9d7f29c88",
+            "type": "debug",
+            "z": "8a7a85d30c1477cc",
+            "name": "debug 2",
+            "active": true,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "false",
+            "statusVal": "",
+            "statusType": "auto",
+            "x": 490,
+            "y": 680,
+            "wires": []
+        },
+        {
+            "id": "cb_trend_cron",
+            "type": "cronplus",
+            "z": "8a7a85d30c1477cc",
+            "name": "trend tick HH:05",
+            "outputField": "payload",
+            "timeZone": "",
+            "storeName": "",
+            "commandResponseMsgOutput": "output1",
+            "defaultLocation": "",
+            "defaultLocationType": "default",
+            "outputs": 1,
+            "options": [
+                {
+                    "name": "trendHourly",
+                    "topic": "trendHourly",
+                    "payloadType": "default",
+                    "payload": "",
+                    "expressionType": "cron",
+                    "expression": "0 5 * * * * *",
+                    "location": "",
+                    "offset": "0",
+                    "solarType": "all",
+                    "solarEvents": "sunrise,sunset"
+                }
+            ],
+            "x": 150,
+            "y": 700,
+            "wires": [
+                [
+                    "cb_trend_query"
+                ]
+            ]
+        },
+        {
+            "id": "cb_trend_query",
+            "type": "influxdb in",
+            "z": "8a7a85d30c1477cc",
+            "influxdb": "influxdb_config_infra",
+            "name": "24h cell_delta medians",
+            "query": "SELECT MEDIAN(cell_delta) FROM bms_health WHERE time > now() - 24h GROUP BY time(1h), bank FILL(none)",
+            "rawOutput": true,
+            "precision": "",
+            "retentionPolicy": "",
+            "org": "organisation",
+            "x": 410,
+            "y": 700,
+            "wires": [
+                [
+                    "cb_trend_eval"
+                ]
+            ]
+        },
+        {
+            "id": "cb_trend_eval",
+            "type": "function",
+            "z": "8a7a85d30c1477cc",
+            "name": "trend_eval",
+            "func": "// Trend evaluator. Receives raw InfluxDB query result on msg.payload:\n//   SELECT MEDIAN(cell_delta) FROM bms_health\n//   WHERE time > now() - 24h GROUP BY time(1h), bank FILL(none)\n// Per bank, fits a linear regression to the hourly medians. Emits a\n// `trend_cell_delta_growth` event when slope exceeds threshold (mV/day).\n// Needs >= 6 hourly buckets to fire — earlier hours just no-op.\n\nconst TH_SLOPE_MV_PER_DAY = 5;\nconst NOW_ISO = new Date().toISOString();\n\nconst data = msg.payload;\nlet series = [];\nif (data && data.results && data.results[0] && Array.isArray(data.results[0].series)) {\n    series = data.results[0].series;\n} else if (Array.isArray(data) && data[0] && data[0].series) {\n    series = data[0].series;\n}\nif (!series.length) {\n    node.warn('trend_eval: no series in payload');\n    return null;\n}\n\nconst out = [];\nfor (const ser of series) {\n    const bank = ser.tags && ser.tags.bank;\n    if (!bank) continue;\n    const cols = ser.columns || [];\n    const tIdx = cols.indexOf('time');\n    let mIdx = cols.indexOf('median');\n    if (mIdx < 0) mIdx = cols.findIndex(c => typeof c === 'string' && c.indexOf('median') === 0);\n    if (tIdx < 0 || mIdx < 0) continue;\n\n    const pts = [];\n    for (const row of ser.values || []) {\n        const t = new Date(row[tIdx]).getTime();\n        const m = parseFloat(row[mIdx]);\n        if (Number.isFinite(m) && Number.isFinite(t)) pts.push([t, m]);\n    }\n    if (pts.length < 6) continue;\n\n    const t0 = pts[0][0];\n    let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;\n    for (const p of pts) {\n        const x = (p[0] - t0) / 3600000;\n        n++; sx += x; sy += p[1]; sxx += x*x; sxy += x*p[1];\n    }\n    const denom = n*sxx - sx*sx;\n    if (denom === 0) continue;\n    const slopeVPerHr = (n*sxy - sx*sy) / denom;\n    const slopeMvPerDay = slopeVPerHr * 24 * 1000;\n\n    if (slopeMvPerDay > TH_SLOPE_MV_PER_DAY) {\n        out.push({\n            topic: 'checkbattery/alert',\n            payload: {\n                ts: NOW_ISO,\n                bank,\n                severity: 'warn',\n                code: 'trend_cell_delta_growth',\n                msg: `cell_delta median trending +${slopeMvPerDay.toFixed(2)} mV/day over last 24h (n=${n} hourly buckets)`,\n                value: slopeMvPerDay,\n                since: NOW_ISO,\n                state: 'event'\n            }\n        });\n    }\n}\nreturn [out];\n",
+            "outputs": 1,
+            "timeout": 0,
+            "noerr": 0,
+            "initialize": "",
+            "finalize": "",
+            "libs": [],
+            "x": 660,
+            "y": 700,
+            "wires": [
+                [
+                    "cb_alert_out",
+                    "cb_trend_debug"
+                ]
+            ]
+        },
+        {
+            "id": "cb_trend_debug",
+            "type": "debug",
+            "z": "8a7a85d30c1477cc",
+            "name": "trend",
+            "active": true,
+            "tosidebar": true,
+            "console": false,
+            "tostatus": false,
+            "complete": "payload",
+            "targetType": "msg",
+            "statusVal": "",
+            "statusType": "auto",
+            "x": 870,
+            "y": 700,
             "wires": []
         }
     ]
