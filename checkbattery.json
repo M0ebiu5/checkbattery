@@ -7,7 +7,7 @@
             "type": "comment",
             "z": "8a7a85d30c1477cc",
             "name": "=== Changelog ===",
-            "info": "### 2026-05-11\n- Iter4c: dashboard publish now reuses the 180s `cb_cron` tick \u2014 dedicated `bb_pub_cron` removed. Dashboard cards refresh on the same cadence as the evaluator (every 3 minutes, wall-clock aligned to 0/3 min).\n\n### 2026-05-11\n- Iter4b: dark card theme, white text. Per-cell tile now shows signed deviation from bank avg as the dominant value (large), with voltage below. Header now carries total voltage + current next to bank name (current colored green when charging, amber when discharging). Min cell border cyan, max cell border gold.\n\n### 2026-05-11\n- Iter4: dashboard visualization. New \"Batteries\" tab, one card per bank stacked vertically.\n- `bb_pub_cron` (cronplus, 5s) -> `bb_publish` (function, 3 outputs) -> per-bank `bb_tpl_<bank>` (ui_template).\n- `bb_publish` reads `flow.bms_state`, computes per-cell severity (ok/warn/crit) using same thresholds as `cb_evaluate`: cell_under <2.80V / cell_over >3.60V => crit; |v - bank_avg| > 30mV => warn. Delta severity: <50mV ok, 50-100mV warn, >=100mV crit. Temps outside [-10,50]C and MOSFET >60C => crit. Switches not ON => crit. Comm dropout >3min dims the card and shows STALE banner.\n- Each card: header (bank name + age), summary grid (SOC, voltage, current, power, cycles, delta, T1/T2/MOSFET, min/max/avg cell), switch chips, 4x4 cell tile grid (idx + voltage, color-coded; min cell border blue, max cell border red).\n\n### 2026-05-05\n- Iter3: debounce + trend.\n- Per-condition debounce in `cb_evaluate`. Statistical checks (cell_delta_warn/alert, cell_outlier_*, temp_high/low_*, mosfet_temp_high) require 3 consecutive ticks (~9min @ 180s) before flipping state. Safety-critical checks (no_data, comm_dropout, cell_under, cell_over, switch_charge_off, switch_discharge_off) emit `active` immediately, require 3 clear ticks to resolve. Events (bms_reboot, cycles_reset) stay one-shot.\n- Trend pipeline: `cb_trend_cron` (cronplus, hourly @ HH:05) -> `cb_trend_query` (influxdb in, raw output, 1h-bucketed MEDIAN of cell_delta over 24h GROUP BY bank) -> `cb_trend_eval` (linear regression of slope, mV/day) -> `cb_alert_out`. Threshold 5 mV/day; needs >=6 hourly buckets.\n\n### 2026-05-05\n- Iter2: monitoring pipeline. cron-plus tick @ 180s aligned -> cb_evaluate -> alert MQTT (`checkbattery/alert`) + InfluxDB `infra.bms_health`.\n- Health checks: comm dropout (3min), cell delta warn/alert (50/100mV), cell hard limits (2.8/3.6V), per-cell outlier (30mV from bank avg), temperatures 1+2 (-10/50C, sensors 3/4 ignored), MOSFET temp (60C), switch charge/discharge OFF, BMS reboot, cycle counter monotonic.\n- InfluxDB metrics per bank: soc_percent, total_voltage, current, power, balance_current, num_cycles, cell_delta/min/max/avg, capacity_ah, mosfet_temp, temp1, temp2.\n- Alerts emit only on state transitions (active / cleared) -- no per-tick spam.\n\n### 2026-05-05\n- Bootstrap: subscribe to bat_ost, bat_west, bat_big at central MQTT broker; capture last payload per leaf-topic into `global.checkbattery_samples` for schema discovery.\n",
+            "info": "### 2026-05-11\n- Iter4d: manual refresh. New `bb_grp_ctrl` ui_group at top of Batteries tab with a `bb_btn_refresh` ui_button (\"\u21bb Refresh\") wired into `bb_publish`. Click fires the publish function on demand without waiting for the 180s tick.\n\n### 2026-05-11\n- Iter4c: dashboard publish now reuses the 180s `cb_cron` tick \u2014 dedicated `bb_pub_cron` removed. Dashboard cards refresh on the same cadence as the evaluator (every 3 minutes, wall-clock aligned to 0/3 min).\n\n### 2026-05-11\n- Iter4b: dark card theme, white text. Per-cell tile now shows signed deviation from bank avg as the dominant value (large), with voltage below. Header now carries total voltage + current next to bank name (current colored green when charging, amber when discharging). Min cell border cyan, max cell border gold.\n\n### 2026-05-11\n- Iter4: dashboard visualization. New \"Batteries\" tab, one card per bank stacked vertically.\n- `bb_pub_cron` (cronplus, 5s) -> `bb_publish` (function, 3 outputs) -> per-bank `bb_tpl_<bank>` (ui_template).\n- `bb_publish` reads `flow.bms_state`, computes per-cell severity (ok/warn/crit) using same thresholds as `cb_evaluate`: cell_under <2.80V / cell_over >3.60V => crit; |v - bank_avg| > 30mV => warn. Delta severity: <50mV ok, 50-100mV warn, >=100mV crit. Temps outside [-10,50]C and MOSFET >60C => crit. Switches not ON => crit. Comm dropout >3min dims the card and shows STALE banner.\n- Each card: header (bank name + age), summary grid (SOC, voltage, current, power, cycles, delta, T1/T2/MOSFET, min/max/avg cell), switch chips, 4x4 cell tile grid (idx + voltage, color-coded; min cell border blue, max cell border red).\n\n### 2026-05-05\n- Iter3: debounce + trend.\n- Per-condition debounce in `cb_evaluate`. Statistical checks (cell_delta_warn/alert, cell_outlier_*, temp_high/low_*, mosfet_temp_high) require 3 consecutive ticks (~9min @ 180s) before flipping state. Safety-critical checks (no_data, comm_dropout, cell_under, cell_over, switch_charge_off, switch_discharge_off) emit `active` immediately, require 3 clear ticks to resolve. Events (bms_reboot, cycles_reset) stay one-shot.\n- Trend pipeline: `cb_trend_cron` (cronplus, hourly @ HH:05) -> `cb_trend_query` (influxdb in, raw output, 1h-bucketed MEDIAN of cell_delta over 24h GROUP BY bank) -> `cb_trend_eval` (linear regression of slope, mV/day) -> `cb_alert_out`. Threshold 5 mV/day; needs >=6 hourly buckets.\n\n### 2026-05-05\n- Iter2: monitoring pipeline. cron-plus tick @ 180s aligned -> cb_evaluate -> alert MQTT (`checkbattery/alert`) + InfluxDB `infra.bms_health`.\n- Health checks: comm dropout (3min), cell delta warn/alert (50/100mV), cell hard limits (2.8/3.6V), per-cell outlier (30mV from bank avg), temperatures 1+2 (-10/50C, sensors 3/4 ignored), MOSFET temp (60C), switch charge/discharge OFF, BMS reboot, cycle counter monotonic.\n- InfluxDB metrics per bank: soc_percent, total_voltage, current, power, balance_current, num_cycles, cell_delta/min/max/avg, capacity_ah, mosfet_temp, temp1, temp2.\n- Alerts emit only on state transitions (active / cleared) -- no per-tick spam.\n\n### 2026-05-05\n- Bootstrap: subscribe to bat_ost, bat_west, bat_big at central MQTT broker; capture last payload per leaf-topic into `global.checkbattery_samples` for schema discovery.\n",
             "x": 160,
             "y": 40,
             "wires": []
@@ -399,6 +399,34 @@
             "wires": [
                 []
             ]
+        },
+        {
+            "id": "bb_btn_refresh",
+            "type": "ui_button",
+            "z": "8a7a85d30c1477cc",
+            "name": "refresh",
+            "group": "bb_grp_ctrl",
+            "order": 1,
+            "width": 4,
+            "height": 1,
+            "passthru": false,
+            "label": "\u21bb Refresh",
+            "tooltip": "Trigger an immediate dashboard refresh",
+            "color": "",
+            "bgcolor": "",
+            "className": "",
+            "icon": "",
+            "payload": "manual",
+            "payloadType": "str",
+            "topic": "refresh",
+            "topicType": "str",
+            "x": 150,
+            "y": 820,
+            "wires": [
+                [
+                    "bb_publish"
+                ]
+            ]
         }
     ],
     "configs": [
@@ -447,6 +475,17 @@
             "collapse": false,
             "className": "",
             "z": "8a7a85d30c1477cc"
+        },
+        {
+            "id": "bb_grp_ctrl",
+            "type": "ui_group",
+            "name": "controls",
+            "tab": "bb_tab",
+            "order": 0,
+            "disp": false,
+            "width": 14,
+            "collapse": false,
+            "className": ""
         }
     ]
 }
